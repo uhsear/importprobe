@@ -31,13 +31,14 @@ applied, and reports every module whose result differs.
     python importprobe.py --script nightly.py --out report.json --apply
 
 --script is read with ast and never run. Only the modules it imports are
-imported, in children, one process per module and context.
+imported, in children, one process per module and context. Importing a module
+runs its top-level code, twice, so a module that writes at import writes.
 
 Exit codes: 0 PASS, 1 FAIL (an import dies in the task context, or a probe
 process died), 3 WARN (every import works but something differs, is shadowed,
 or nothing could be probed), 2 a file could not be read or written or the
 interpreter could not run the probe, 64 usage error, 70 an unexpected crash,
-which is never a finding. Nothing is written without --apply.
+which is never a finding. importprobe itself writes nothing without --apply.
 """
 
 from __future__ import print_function
@@ -89,13 +90,21 @@ SURPRISING = ("user-site", "script-dir")
 # a different wording falls through to IMPORT-ERROR instead of being guessed.
 _LICENCE = re.compile(r"licen[cs]e.{0,40}not.{0,20}initiali[sz]ed", re.I)
 
-# Exceptions an `except` clause can name to guard an optional import.
-_IMPORT_CATCHERS = ("ImportError", "ModuleNotFoundError", "Exception",
-                    "BaseException")
+# Exceptions an `except` clause can name to guard an import. The first pair is
+# ImportError and its subclass. The second pair catches every error.
+_IMPORT_CATCHERS = ("ImportError", "ModuleNotFoundError")
+_ANY_CATCHERS = ("Exception", "BaseException")
 
 # Names of variables whose values are treated as secrets. A value of one of
-# these is replaced in every line the tool prints or writes.
-_SECRETISH = re.compile(r"token|passw|secret|key|pwd|cred", re.I)
+# these is replaced in every line the tool prints or writes. PWD and OLDPWD
+# match "pwd" but hold the working directory, so they are never hidden.
+_SECRETISH = re.compile(r"token|pass|secret|key|pwd|cred|auth|conn|dsn|url",
+                        re.I)
+_NOT_SECRET = ("PWD", "OLDPWD")
+
+# Longest error text the child sends. The parent redacts first and clips to
+# CLIP after, so a secret that straddles the clip is still replaced whole.
+CLIP = 300
 
 _EXIT = {OK: 0, FAIL: 1, WARN: 3}
 
@@ -117,13 +126,15 @@ class Finding(object):
 # ----------------------------------------------------------------- the child
 
 def child_main(spec, out):
-    """Import one module and write what happened to `out` as one JSON line.
+    """Import one module and write what happened to `out` as one line.
 
     This function runs INSIDE the target interpreter. The parent sends its
     source with `python -c`, so the probe imports nothing of this file and the
     imports below are the only ones the probe adds to a fresh interpreter.
-    Everything is imported inside the function for that reason. `json` comes
-    last, so probing `json` is not distorted by the probe itself.
+    Everything is imported inside the function for that reason. The result is
+    written with ascii(), a plain literal the parent reads with
+    ast.literal_eval. The probe imports no `json`, because a json.py beside the
+    script would then replace the probe's own serialiser.
     """
     startup = set(sys.modules)
     import importlib
@@ -191,10 +202,19 @@ def child_main(spec, out):
                 licence["product"] = str(sys.modules[top].ProductInfo())
             except Exception as exc:
                 licence["error"] = "%s: %s" % (type(exc).__name__,
-                                               str(exc)[:300])
+                                               str(exc)[:20000])
     except BaseException as exc:
         module["error_type"] = type(exc).__name__
-        module["error"] = str(exc)[:300]
+        module["error"] = str(exc)[:20000]
+        # `from pkg import name` probes pkg.name. When pkg imports and has no
+        # such submodule, Python still accepts an attribute called name.
+        if (spec.get("soft") and isinstance(exc, ModuleNotFoundError)
+                and getattr(exc, "name", None) == name):
+            parent, _, attr = name.rpartition(".")
+            if not hasattr(sys.modules[parent], attr):
+                module["error_type"] = "ImportError"
+                module["error"] = "cannot import name '%s' from '%s'" % (
+                    attr, parent)
         # Innermost frame that is not the probe or the import machinery, so
         # the location names the module code that raised and a module that is
         # simply missing names nothing.
@@ -207,11 +227,10 @@ def child_main(spec, out):
                     or filename.startswith(importlib_dir)):
                 module["where"] = "%s:%d" % (filename, frame.tb_lineno)
             frame = frame.tb_next
-    import json
     # The leading newline keeps the marker on its own line when the module
     # wrote text at import without a trailing one.
-    out.write("\n" + MARKER + json.dumps({"facts": facts, "module": module,
-                                          "licence": licence}) + "\n")
+    out.write("\n" + MARKER + ascii({"facts": facts, "module": module,
+                                     "licence": licence}) + "\n")
     out.flush()
 
 
@@ -232,16 +251,22 @@ def parse_env_pairs(items):
 def secret_pairs(overrides, ambient):
     """[(name, value)] to hide from every line the tool prints or writes.
 
-    A value of four or more characters is hidden when its name looks secret
-    (token, password, secret, key, pwd, cred), in the shell environment or in
-    --env. A --env value of six or more characters is hidden whatever its
-    name, except for PYTHON* variables, which are settings and not secrets.
+    A name looks secret when it contains token, pass, secret, key, pwd, cred,
+    auth, conn, dsn or url, except PWD and OLDPWD. The value of such a variable
+    in the shell environment is hidden at four characters or more, and in
+    --env at three or more. A --env value of four or more characters under any
+    other name is hidden too, except for PYTHON* variables, which are
+    settings and not secrets. A secret under a name that matches none of these
+    is not hidden.
     """
+    def secretish(name):
+        return bool(_SECRETISH.search(name)) and name.upper() not in _NOT_SECRET
+
     pairs = [(n, v) for n, v in ambient.items()
-             if _SECRETISH.search(n) and len(v) >= 4]
+             if secretish(n) and len(v) >= 4]
     pairs.extend((n, v) for n, v in overrides.items()
-                 if len(v) >= 4 and (_SECRETISH.search(n) or (
-                     len(v) >= 6 and not n.upper().startswith("PYTHON"))))
+                 if (secretish(n) and len(v) >= 3) or (
+                     len(v) >= 4 and not n.upper().startswith("PYTHON")))
     return pairs
 
 
@@ -252,23 +277,97 @@ def redact(text, secrets):
     return text
 
 
-def _guards_import(handler):
-    """True when an except clause would swallow a failed import."""
+def _guard_level(handler):
+    """What an except clause swallows: 0 nothing that matters to an import,
+    1 ImportError (and ModuleNotFoundError), 2 every error."""
     kinds = (handler.type.elts if isinstance(handler.type, ast.Tuple)
              else [handler.type])
-    return any(kind is None or (isinstance(kind, ast.Name)
-                                and kind.id in _IMPORT_CATCHERS)
-               for kind in kinds)
+    level = 0
+    for kind in kinds:
+        if kind is None or (isinstance(kind, ast.Name)
+                            and kind.id in _ANY_CATCHERS):
+            level = 2
+        elif isinstance(kind, ast.Name) and kind.id in _IMPORT_CATCHERS:
+            level = max(level, 1)
+    return level
 
 
-def _walk_imports(stmts, optional, found, subs):
-    """Collect (name, optional) for imports that run when the file loads.
+def _stops(handler):
+    """True when the handler body raises or calls exit(), quit(), sys.exit()
+    or os._exit() anywhere, so the script dies without the module."""
+    for node in (n for stmt in handler.body for n in ast.walk(stmt)):
+        if isinstance(node, ast.Raise):
+            return True
+        if isinstance(node, ast.Call):
+            func = node.func
+            if ((isinstance(func, ast.Name) and func.id in ("exit", "quit"))
+                    or (isinstance(func, ast.Attribute)
+                        and func.attr in ("exit", "_exit")
+                        and isinstance(func.value, ast.Name)
+                        and func.value.id in ("sys", "os"))):
+                return True
+    return False
 
+
+def _swallow_level(handler):
+    """The guard level of a handler, or 0 when it stops the script."""
+    return 0 if _stops(handler) else _guard_level(handler)
+
+
+def _try_level(handlers):
+    """The level the first handler that catches an import error gives."""
+    for handler in handlers:
+        if _guard_level(handler):
+            return _swallow_level(handler)
+    return 0
+
+
+def _own_calls(stmt):
+    """Call nodes in a statement outside its nested statements and lambdas."""
+    stack = [stmt]
+    while stack:
+        for child in ast.iter_child_nodes(stack.pop()):
+            if isinstance(child, (ast.stmt, ast.excepthandler, ast.Lambda)):
+                continue
+            if isinstance(child, ast.Call):
+                yield child
+            stack.append(child)
+
+
+def _import_call(call):
+    """None when `call` is not importlib.import_module() or __import__().
+    Otherwise the module name when it is a string constant, else ""."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        called = func.id
+    elif (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+          and func.value.id == "importlib"):
+        called = func.attr
+    else:
+        return None
+    if called not in ("import_module", "__import__"):
+        return None
+    arg = call.args[0] if call.args else None
+    if (isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+            and arg.value and not arg.value.startswith(".")):
+        return arg.value
+    return ""
+
+
+def _walk_imports(stmts, optional, found, subs, dyn):
+    """Collect {name: level} for imports that run when the file loads.
+
+    The level is 0 for a required import, 1 when an except clause for
+    ImportError guards it and 2 when an except clause for any error does. An
+    except clause that raises or exits does not guard: the script dies anyway.
     Function bodies are skipped: they run later, after logging exists. An
-    import inside a try whose handler catches ImportError is optional, and so
-    is an import in that handler, because it is the fallback and runs only when
-    the first import failed. `from pkg import name` also records pkg.name in
-    `subs`, because name may be a submodule that dies on its own.
+    import inside a try whose handler guards is optional, and so is an import
+    in that handler, because it is the fallback and runs only when the first
+    import failed. `from pkg import name` also records pkg.name in `subs`,
+    because name may be a submodule that dies on its own. A call to
+    importlib.import_module() or __import__() with a constant name counts as
+    an import. When the name is not constant, and no guard covers the call, the
+    line number goes into `dyn`.
     """
     for stmt in stmts:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -281,34 +380,44 @@ def _walk_imports(stmts, optional, found, subs):
             for alias in stmt.names:
                 if alias.name != "*":
                     key = "%s.%s" % (stmt.module, alias.name)
-                    subs[key] = subs.get(key, True) and optional
+                    subs[key] = min(subs.get(key, 2), optional)
+        for call in _own_calls(stmt):
+            target = _import_call(call)
+            if target:
+                names.append(target)
+            elif target == "" and not optional:
+                dyn.append(call.lineno)
         for name in names:
-            found[name] = found.get(name, True) and optional
+            found[name] = min(found.get(name, 2), optional)
         if isinstance(stmt, ast.Try):
-            guarded = optional or any(_guards_import(h)
-                                      for h in stmt.handlers)
-            _walk_imports(stmt.body, guarded, found, subs)
+            _walk_imports(stmt.body, max(optional, _try_level(stmt.handlers)),
+                          found, subs, dyn)
             for handler in stmt.handlers:
-                _walk_imports(handler.body, optional or _guards_import(handler),
-                              found, subs)
-            _walk_imports(stmt.orelse, optional, found, subs)
-            _walk_imports(stmt.finalbody, optional, found, subs)
+                _walk_imports(handler.body,
+                              max(optional, _swallow_level(handler)),
+                              found, subs, dyn)
+            _walk_imports(stmt.orelse, optional, found, subs, dyn)
+            _walk_imports(stmt.finalbody, optional, found, subs, dyn)
         else:
-            _walk_imports(getattr(stmt, "body", []), optional, found, subs)
-            _walk_imports(getattr(stmt, "orelse", []), optional, found, subs)
+            _walk_imports(getattr(stmt, "body", []), optional, found, subs,
+                          dyn)
+            _walk_imports(getattr(stmt, "orelse", []), optional, found, subs,
+                          dyn)
 
 
-def script_imports(text, subs=None):
-    """[(module, optional)] a script imports at load time, in first-seen order.
+def script_imports(text, subs=None, dyn=None):
+    """[(module, level)] a script imports at load time, in first-seen order.
 
     The script is parsed, never run. A SyntaxError propagates. A name that is
-    imported once guarded and once unguarded counts as required. When `subs`
-    is a dict, it receives {"pkg.name": optional} for each `from pkg import
-    name`.
+    imported once guarded and once unguarded counts as required, and one that
+    is guarded two ways takes the lower level. When `subs` is a dict, it
+    receives {"pkg.name": level} for each `from pkg import name`. When `dyn`
+    is a list, it receives the line of each unguarded import call whose name
+    is not a constant.
     """
     found = {}
-    _walk_imports(ast.parse(text).body, False, found,
-                  {} if subs is None else subs)
+    _walk_imports(ast.parse(text).body, 0, found,
+                  {} if subs is None else subs, [] if dyn is None else dyn)
     return [(name, found[name]) for name in found]
 
 
@@ -320,8 +429,8 @@ def plan_entries(modules, imports, subs):
     there is not a finding. A name seen twice is required if any use is.
     """
     seen = {}
-    for name, optional in [(m, False) for m in modules] + list(imports):
-        seen[name] = seen.get(name, True) and optional
+    for name, optional in [(m, 0) for m in modules] + list(imports):
+        seen[name] = min(seen.get(name, 2), optional)
     soft = [name for name in subs if name not in seen]
     entries = [(name, seen[name]) for name in seen]
     entries.extend((name, subs[name]) for name in soft)
@@ -458,7 +567,10 @@ def compare_module(name, optional, h, t, lead, soft=False):
                                   % (place, tm["origin"])))
         return out
     code = classify_error(tm["error_type"], tm["error"], hm["ok"])
-    severity = WARN if (optional and code == "NOT-IMPORTABLE") else FAIL
+    # Level 1 guards ImportError only. Level 2 guards every error.
+    swallowed = optional == 2 or (optional == 1 and tm["error_type"] in (
+        "ImportError", "ModuleNotFoundError"))
+    severity = WARN if swallowed else FAIL
     if code == "NOT-IMPORTABLE" and hm["ok"] and classify_location(
             hm["top_origin"], h["facts"], lead) == "user-site":
         code = "USER-SITE-ONLY"
@@ -490,6 +602,9 @@ def parse_task_xml(data):
         root = ET.fromstring(text)
     except ET.ParseError as exc:
         raise ValueError("the task XML does not parse: %s" % exc)
+    if root.tag.rsplit("}", 1)[-1] != "Task":
+        raise ValueError("the file is not a Task Scheduler export: its root "
+                         "element is not Task")
 
     def text_at(*path):
         nodes = [root]
@@ -536,17 +651,35 @@ def exit_code(verdict):
     return _EXIT[verdict]
 
 
+def _clean(result, secrets):
+    """A copy of a probe result with every secret removed from its error
+    text. The text is redacted whole and clipped to CLIP after, so a secret
+    that crosses the clip is not left half shown."""
+    if "crash" in result:
+        return {"crash": redact(result["crash"], secrets)}
+    module = dict(result["module"])
+    if module["error"] is not None:
+        module["error"] = redact(module["error"], secrets)[:CLIP]
+    licence = result["licence"]
+    if licence is not None and licence["error"]:
+        licence = dict(licence, error=redact(licence["error"], secrets)[:CLIP])
+    return dict(result, module=module, licence=licence)
+
+
 def build_report(python, runs, lead, env_names, task=None, soft=(),
-                 secrets=(), scripted=False):
+                 secrets=(), dynamic=()):
     """The whole result as a dict: contexts, per-module status, findings.
 
     `soft` names may be plain attributes and get no row when they are not a
-    finding. `secrets` are (name, value) pairs removed from every finding.
-    `scripted` is True when --script was given, so an empty run is a WARN.
+    finding. `secrets` are (name, value) pairs removed from every finding and
+    every error text. `dynamic` lists the lines of import calls whose name is
+    not a constant. An empty run is a WARN, because it says nothing.
     """
     findings = []
     modules = []
     facts = {"here": None, "task": None}
+    runs = [(n, o, _clean(h, secrets), _clean(t, secrets))
+            for n, o, h, t in runs]
     for name, optional, h, t in runs:
         found = compare_module(name, optional, h, t, lead, name in soft)
         findings.extend(found)
@@ -555,13 +688,19 @@ def build_report(python, runs, lead, env_names, task=None, soft=(),
                 facts[label] = result["facts"]
         if name in soft and not found:
             continue
-        modules.append({"name": name, "optional": optional,
+        modules.append({"name": name, "optional": bool(optional),
                         "here": _status(h), "task": _status(t)})
-    if scripted and not modules:
+    if not modules:
         findings.append(Finding(
-            "<script>", "NOTHING-PROBED", WARN,
-            "the script has no import that runs at load time and can be "
-            "probed, so this run says nothing about it"))
+            "<run>", "NOTHING-PROBED", WARN,
+            "no import was probed, so this run says nothing about whether "
+            "the job's imports work"))
+    if dynamic:
+        findings.append(Finding(
+            "<script>", "DYNAMIC-IMPORT", WARN,
+            "importlib.import_module() or __import__() on line %s uses a "
+            "name that is not a constant, so that import is not probed"
+            % ", ".join(str(n) for n in dynamic)))
     if task is not None:
         findings.extend(task_findings(
             task, any(n.split(".")[0] == "arcpy" for n, _, _, _ in runs)))
@@ -599,6 +738,8 @@ def render(report):
         lines.append("  nothing was probed: no import ran, so this says "
                      "nothing about a script")
     else:
+        lines.append("  note: each module is imported twice, so its "
+                     "top-level code runs twice")
         lines.append("  " + _context_line(
             "here", report["contexts"]["here"], []))
         lines.append("  " + _context_line(
@@ -642,16 +783,21 @@ def child_env(base, overrides):
     return env
 
 
-def _child_command(python, spec):
+def _child_command(python, spec, marker):
     source = ("import sys\nMARKER = %r\n%s\nchild_main(%r, sys.stdout)\n"
-              % (MARKER, inspect.getsource(child_main), spec))
+              % (marker, inspect.getsource(child_main), spec))
     return [python, "-c", source]
 
 
 def run_context(python, spec, env, timeout):
-    """Run one probe process. The result is child_main's dict or a crash."""
+    """Run one probe process. The result is child_main's dict or a crash.
+
+    The marker carries a random token for this run, so a module that prints
+    the plain MARKER prefix cannot forge a result. A marker line that does not
+    parse is skipped."""
+    marker = MARKER + os.urandom(6).hex() + " "
     try:
-        proc = subprocess.run(_child_command(python, spec), env=env,
+        proc = subprocess.run(_child_command(python, spec, marker), env=env,
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -659,23 +805,25 @@ def run_context(python, spec, env, timeout):
     except OSError as exc:
         return {"crash": "cannot start %s: %s" % (python, exc)}
     for line in reversed(proc.stdout.decode("utf-8", "replace").splitlines()):
-        if line.startswith(MARKER):
-            return json.loads(line[len(MARKER):])
+        if line.startswith(marker):
+            try:
+                return ast.literal_eval(line[len(marker):])
+            except (ValueError, SyntaxError):
+                continue
     tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-1:]
     return {"crash": "exit %d with no result%s"
             % (proc.returncode, ": " + tail[0] if tail else "")}
 
 
-def probe(python, entries, base_env, overrides, lead, timeout):
+def probe(python, entries, base_env, overrides, lead, timeout, soft=()):
     """[(name, optional, here result, task result)] for every module."""
     here_env = child_env(base_env, {})
     task_env = child_env(base_env, overrides)
     runs = []
     for name, optional in entries:
-        h = run_context(python, {"module": name, "blank": False,
-                                 "lead": lead}, here_env, timeout)
-        t = run_context(python, {"module": name, "blank": True,
-                                 "lead": lead}, task_env, timeout)
+        spec = {"module": name, "lead": lead, "soft": name in soft}
+        h = run_context(python, dict(spec, blank=False), here_env, timeout)
+        t = run_context(python, dict(spec, blank=True), task_env, timeout)
         runs.append((name, optional, h, t))
     return runs
 
@@ -703,14 +851,15 @@ def _parse(argv):
         prog="importprobe.py",
         description="Import modules the way a scheduled task would, compare "
                     "with your shell, and give a verdict.",
-        epilog="Nothing is written without --apply.",
+        epilog="importprobe writes nothing without --apply. A probed module "
+               "runs its own code, which may write.",
         allow_abbrev=False,
     )
     ap.add_argument("--module", action="append", default=[], metavar="NAME",
                     help="a module to probe; repeat for several")
     ap.add_argument("--script", metavar="FILE",
                     help="a script whose load-time imports are probed. It is "
-                         "parsed and never run.")
+                         "parsed and never run, but its imports are.")
     ap.add_argument("--python", metavar="EXE", default=sys.executable,
                     help="the interpreter the task uses (default: this one)")
     ap.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
@@ -723,7 +872,8 @@ def _parse(argv):
     ap.add_argument("--out", metavar="FILE",
                     help="where to write the report as JSON, with --apply")
     ap.add_argument("--apply", action="store_true",
-                    help="write the --out file. Without it nothing is written.")
+                    help="write the --out file. Without it importprobe "
+                         "writes nothing.")
     ap.add_argument("--self-test", dest="self_test", action="store_true",
                     help="run the offline assertions and exit")
     return ap.parse_args(argv)
@@ -731,18 +881,22 @@ def _parse(argv):
 
 def main(argv=None):
     """Run the CLI. An error this code did not anticipate exits 70, because 1
-    is the code a scheduled job reads as 'an import fails in the task'."""
+    is the code a scheduled job reads as 'an import fails in the task'. Its
+    message and traceback pass through redact() like every other line."""
+    state = {"secrets": []}
     try:
-        return _run(sys.argv[1:] if argv is None else argv)
+        return _run(sys.argv[1:] if argv is None else argv, state)
     except Exception as exc:
-        print("error: unexpected %s: %s. This is a fault in the tool, not a "
-              "finding about the script." % (type(exc).__name__, exc),
+        print(redact("error: unexpected %s: %s. This is a fault in the tool, "
+                     "not a finding about the script."
+                     % (type(exc).__name__, exc), state["secrets"]),
               file=sys.stderr)
-        traceback.print_exc()
+        print(redact(traceback.format_exc(), state["secrets"]),
+              file=sys.stderr)
         return 70
 
 
-def _run(argv):
+def _run(argv, state):
     try:
         args = _parse(argv)
     except UsageError as exc:
@@ -777,37 +931,41 @@ def _run(argv):
               file=sys.stderr)
         return 2
     base_env = os.environ.copy()
+    state["secrets"] = secret_pairs(overrides, base_env)
     # One import of a built-in module tells an interpreter that cannot run the
     # probe at all from an import that dies, which is a finding and not this.
     check = run_context(args.python, {"module": "sys", "blank": False,
                                       "lead": None},
                         child_env(base_env, {}), args.timeout)
     if "crash" in check:
-        print("error: the interpreter %s could not run the probe: %s"
-              % (args.python, check["crash"]), file=sys.stderr)
+        print(redact("error: the interpreter %s could not run the probe: %s"
+                     % (args.python, check["crash"]), state["secrets"]),
+              file=sys.stderr)
         return 2
 
     imports = []
     subs = {}
+    dyn = []
     lead = None
     task = None
     try:
         if args.script:
             with io.open(args.script, encoding="utf-8-sig") as handle:
-                imports = script_imports(handle.read(), subs)
+                imports = script_imports(handle.read(), subs, dyn)
             lead = os.path.dirname(os.path.abspath(args.script))
         if args.task_xml:
             with open(args.task_xml, "rb") as handle:
                 task = parse_task_xml(handle.read())
-    except (IOError, OSError, ValueError, SyntaxError) as exc:
+    except (IOError, OSError, ValueError, SyntaxError,
+            RecursionError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2
     entries, soft = plan_entries(args.module, imports, subs)
 
-    runs = probe(args.python, entries, base_env, overrides, lead, args.timeout)
+    runs = probe(args.python, entries, base_env, overrides, lead, args.timeout,
+                 soft)
     report = build_report(args.python, runs, lead, list(overrides), task, soft,
-                          secret_pairs(overrides, base_env),
-                          bool(args.script))
+                          state["secrets"], dyn)
     for line in render(report):
         print(line)
     if args.out:
