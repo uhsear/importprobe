@@ -17,11 +17,11 @@ differ between the two, and nothing in a console shows any of them.
 
 The existing tool pywho explains one interpreter and one environment: which
 python, why `import X` loaded that file, which files shadow a module. It does
-that well and importprobe does not replace it. What pywho cannot do is run the
-import a second time under the scheduled-task conditions and compare. This
-tool imports each module in two child processes of the target interpreter, one
-as your shell sees it and one with the task conditions applied, and reports
-every module whose result differs.
+that well and importprobe does not replace it. pywho does not document running
+the import a second time under the scheduled-task conditions and comparing.
+This tool imports each module in two child processes of the target
+interpreter, one as your shell sees it and one with the task conditions
+applied, and reports every module whose result differs.
 
     python importprobe.py --self-test
     python importprobe.py --module json --module arcpy
@@ -34,9 +34,10 @@ every module whose result differs.
 imported, in children, one process per module and context.
 
 Exit codes: 0 PASS, 1 FAIL (an import dies in the task context, or a probe
-process died), 3 WARN (every import works but something differs or is
-shadowed), 2 a file could not be read or written, 64 usage error, 70 an
-unexpected crash, which is never a finding. Nothing is written without --apply.
+process died), 3 WARN (every import works but something differs, is shadowed,
+or nothing could be probed), 2 a file could not be read or written or the
+interpreter could not run the probe, 64 usage error, 70 an unexpected crash,
+which is never a finding. Nothing is written without --apply.
 """
 
 from __future__ import print_function
@@ -91,6 +92,10 @@ _LICENCE = re.compile(r"licen[cs]e.{0,40}not.{0,20}initiali[sz]ed", re.I)
 # Exceptions an `except` clause can name to guard an optional import.
 _IMPORT_CATCHERS = ("ImportError", "ModuleNotFoundError", "Exception",
                     "BaseException")
+
+# Names of variables whose values are treated as secrets. A value of one of
+# these is replaced in every line the tool prints or writes.
+_SECRETISH = re.compile(r"token|passw|secret|key|pwd|cred", re.I)
 
 _EXIT = {OK: 0, FAIL: 1, WARN: 3}
 
@@ -180,10 +185,10 @@ def child_main(spec, out):
         module["ok"] = True
         module["origin"] = origin_of(mod)
         module["top_origin"] = origin_of(sys.modules[top])
-        if name == "arcpy":
+        if top == "arcpy":
             licence = {"product": None, "error": None}
             try:
-                licence["product"] = str(mod.ProductInfo())
+                licence["product"] = str(sys.modules[top].ProductInfo())
             except Exception as exc:
                 licence["error"] = "%s: %s" % (type(exc).__name__,
                                                str(exc)[:300])
@@ -203,8 +208,10 @@ def child_main(spec, out):
                 module["where"] = "%s:%d" % (filename, frame.tb_lineno)
             frame = frame.tb_next
     import json
-    out.write(MARKER + json.dumps({"facts": facts, "module": module,
-                                   "licence": licence}) + "\n")
+    # The leading newline keeps the marker on its own line when the module
+    # wrote text at import without a trailing one.
+    out.write("\n" + MARKER + json.dumps({"facts": facts, "module": module,
+                                          "licence": licence}) + "\n")
     out.flush()
 
 
@@ -213,12 +220,36 @@ def child_main(spec, out):
 def parse_env_pairs(items):
     """{name: value} from NAME=VALUE strings, or ValueError for a bad one."""
     env = {}
-    for item in items:
+    for number, item in enumerate(items, 1):
         name, sep, value = item.partition("=")
         if not sep or not name:
-            raise ValueError("--env needs NAME=VALUE, got %r" % (item,))
+            # The item is not echoed: a mistyped one may be the secret itself.
+            raise ValueError("--env item %d needs NAME=VALUE" % number)
         env[name] = value
     return env
+
+
+def secret_pairs(overrides, ambient):
+    """[(name, value)] to hide from every line the tool prints or writes.
+
+    A value of four or more characters is hidden when its name looks secret
+    (token, password, secret, key, pwd, cred), in the shell environment or in
+    --env. A --env value of six or more characters is hidden whatever its
+    name, except for PYTHON* variables, which are settings and not secrets.
+    """
+    pairs = [(n, v) for n, v in ambient.items()
+             if _SECRETISH.search(n) and len(v) >= 4]
+    pairs.extend((n, v) for n, v in overrides.items()
+                 if len(v) >= 4 and (_SECRETISH.search(n) or (
+                     len(v) >= 6 and not n.upper().startswith("PYTHON"))))
+    return pairs
+
+
+def redact(text, secrets):
+    """`text` with every secret value replaced by <redacted:NAME>."""
+    for name, value in sorted(secrets, key=lambda p: -len(p[1])):
+        text = text.replace(value, "<redacted:%s>" % name)
+    return text
 
 
 def _guards_import(handler):
@@ -230,11 +261,14 @@ def _guards_import(handler):
                for kind in kinds)
 
 
-def _walk_imports(stmts, optional, found):
+def _walk_imports(stmts, optional, found, subs):
     """Collect (name, optional) for imports that run when the file loads.
 
     Function bodies are skipped: they run later, after logging exists. An
-    import inside a try whose handler catches ImportError is optional.
+    import inside a try whose handler catches ImportError is optional, and so
+    is an import in that handler, because it is the fallback and runs only when
+    the first import failed. `from pkg import name` also records pkg.name in
+    `subs`, because name may be a submodule that dies on its own.
     """
     for stmt in stmts:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -244,30 +278,54 @@ def _walk_imports(stmts, optional, found):
             names = [alias.name for alias in stmt.names]
         elif isinstance(stmt, ast.ImportFrom) and stmt.level == 0:
             names = [stmt.module]
+            for alias in stmt.names:
+                if alias.name != "*":
+                    key = "%s.%s" % (stmt.module, alias.name)
+                    subs[key] = subs.get(key, True) and optional
         for name in names:
             found[name] = found.get(name, True) and optional
         if isinstance(stmt, ast.Try):
             guarded = optional or any(_guards_import(h)
                                       for h in stmt.handlers)
-            _walk_imports(stmt.body, guarded, found)
+            _walk_imports(stmt.body, guarded, found, subs)
             for handler in stmt.handlers:
-                _walk_imports(handler.body, optional, found)
-            _walk_imports(stmt.orelse, optional, found)
-            _walk_imports(stmt.finalbody, optional, found)
+                _walk_imports(handler.body, optional or _guards_import(handler),
+                              found, subs)
+            _walk_imports(stmt.orelse, optional, found, subs)
+            _walk_imports(stmt.finalbody, optional, found, subs)
         else:
-            _walk_imports(getattr(stmt, "body", []), optional, found)
-            _walk_imports(getattr(stmt, "orelse", []), optional, found)
+            _walk_imports(getattr(stmt, "body", []), optional, found, subs)
+            _walk_imports(getattr(stmt, "orelse", []), optional, found, subs)
 
 
-def script_imports(text):
+def script_imports(text, subs=None):
     """[(module, optional)] a script imports at load time, in first-seen order.
 
     The script is parsed, never run. A SyntaxError propagates. A name that is
-    imported once guarded and once unguarded counts as required.
+    imported once guarded and once unguarded counts as required. When `subs`
+    is a dict, it receives {"pkg.name": optional} for each `from pkg import
+    name`.
     """
     found = {}
-    _walk_imports(ast.parse(text).body, False, found)
+    _walk_imports(ast.parse(text).body, False, found,
+                  {} if subs is None else subs)
     return [(name, found[name]) for name in found]
+
+
+def plan_entries(modules, imports, subs):
+    """([(name, optional)], soft) to probe, and the names that are soft.
+
+    A soft name is pkg.name from `from pkg import name` that is not also
+    imported as a module. It may be a plain attribute, so a missing module
+    there is not a finding. A name seen twice is required if any use is.
+    """
+    seen = {}
+    for name, optional in [(m, False) for m in modules] + list(imports):
+        seen[name] = seen.get(name, True) and optional
+    soft = [name for name in subs if name not in seen]
+    entries = [(name, seen[name]) for name in seen]
+    entries.extend((name, subs[name]) for name in soft)
+    return entries, set(soft)
 
 
 def _norm(path):
@@ -332,11 +390,20 @@ def _describe(module):
     return "%s: %s%s" % (module["error_type"], module["error"], where)
 
 
-def compare_module(name, optional, h, t, lead):
+def names_missing(name, error_type, message):
+    """True when a ModuleNotFoundError names `name` or a package above it."""
+    found = re.match(r"No module named '([^']+)'", message or "")
+    return (error_type == "ModuleNotFoundError" and found is not None
+            and (name == found.group(1)
+                 or name.startswith(found.group(1) + ".")))
+
+
+def compare_module(name, optional, h, t, lead, soft=False):
     """Findings for one module from its here result and its task result.
 
     h and t are what child_main wrote, or {"crash": text} when the process
-    died or wrote nothing.
+    died or wrote nothing. A soft module may be a plain attribute: when it is
+    missing in both contexts it is not a finding.
     """
     out = []
 
@@ -351,6 +418,9 @@ def compare_module(name, optional, h, t, lead):
             % (where, detail))
         return out
     hm, tm = h["module"], t["module"]
+    if soft and not hm["ok"] and names_missing(name, tm["error_type"],
+                                               tm["error"]):
+        return out
     if tm["ok"]:
         if not hm["ok"]:
             add("PASSES-ONLY-IN-TASK", WARN,
@@ -466,21 +536,37 @@ def exit_code(verdict):
     return _EXIT[verdict]
 
 
-def build_report(python, runs, lead, env_names, task=None):
-    """The whole result as a dict: contexts, per-module status, findings."""
+def build_report(python, runs, lead, env_names, task=None, soft=(),
+                 secrets=(), scripted=False):
+    """The whole result as a dict: contexts, per-module status, findings.
+
+    `soft` names may be plain attributes and get no row when they are not a
+    finding. `secrets` are (name, value) pairs removed from every finding.
+    `scripted` is True when --script was given, so an empty run is a WARN.
+    """
     findings = []
     modules = []
     facts = {"here": None, "task": None}
     for name, optional, h, t in runs:
-        findings.extend(compare_module(name, optional, h, t, lead))
-        modules.append({"name": name, "optional": optional,
-                        "here": _status(h), "task": _status(t)})
+        found = compare_module(name, optional, h, t, lead, name in soft)
+        findings.extend(found)
         for label, result in (("here", h), ("task", t)):
             if facts[label] is None and "crash" not in result:
                 facts[label] = result["facts"]
+        if name in soft and not found:
+            continue
+        modules.append({"name": name, "optional": optional,
+                        "here": _status(h), "task": _status(t)})
+    if scripted and not modules:
+        findings.append(Finding(
+            "<script>", "NOTHING-PROBED", WARN,
+            "the script has no import that runs at load time and can be "
+            "probed, so this run says nothing about it"))
     if task is not None:
         findings.extend(task_findings(
             task, any(n.split(".")[0] == "arcpy" for n, _, _, _ in runs)))
+    for finding in findings:
+        finding.text = redact(finding.text, secrets)
     return {"python": python, "env_overrides": sorted(env_names),
             "contexts": facts, "modules": modules,
             "findings": [f.as_dict() for f in findings],
@@ -509,7 +595,10 @@ def render(report):
     """The report as text lines, ASCII only."""
     lines = ["importprobe: %s, %d module(s)"
              % (report["python"], len(report["modules"]))]
-    if report["modules"]:
+    if not report["modules"]:
+        lines.append("  nothing was probed: no import ran, so this says "
+                     "nothing about a script")
+    else:
         lines.append("  " + _context_line(
             "here", report["contexts"]["here"], []))
         lines.append("  " + _context_line(
@@ -668,9 +757,16 @@ def _run(argv):
         print("error: name --module, --script or --task-xml. Use --self-test "
               "to verify the tool without them.", file=sys.stderr)
         return 64
-    if args.timeout <= 0:
-        print("error: --timeout must be above zero.", file=sys.stderr)
+    # Written as a negated chain so that nan, which compares false, is refused.
+    if not 0 < args.timeout <= 1e6:
+        print("error: --timeout must be above zero and at most 1000000.",
+              file=sys.stderr)
         return 64
+    for source in (args.script, args.task_xml):
+        if args.out and source and _norm(source) == _norm(args.out):
+            print("error: --out must not name the --script or --task-xml "
+                  "file.", file=sys.stderr)
+            return 64
     try:
         overrides = parse_env_pairs(args.env)
     except ValueError as exc:
@@ -680,14 +776,25 @@ def _run(argv):
         print("error: the interpreter %s does not exist." % args.python,
               file=sys.stderr)
         return 2
+    base_env = os.environ.copy()
+    # One import of a built-in module tells an interpreter that cannot run the
+    # probe at all from an import that dies, which is a finding and not this.
+    check = run_context(args.python, {"module": "sys", "blank": False,
+                                      "lead": None},
+                        child_env(base_env, {}), args.timeout)
+    if "crash" in check:
+        print("error: the interpreter %s could not run the probe: %s"
+              % (args.python, check["crash"]), file=sys.stderr)
+        return 2
 
-    entries = [(name, False) for name in args.module]
+    imports = []
+    subs = {}
     lead = None
     task = None
     try:
         if args.script:
             with io.open(args.script, encoding="utf-8-sig") as handle:
-                entries.extend(script_imports(handle.read()))
+                imports = script_imports(handle.read(), subs)
             lead = os.path.dirname(os.path.abspath(args.script))
         if args.task_xml:
             with open(args.task_xml, "rb") as handle:
@@ -695,14 +802,12 @@ def _run(argv):
     except (IOError, OSError, ValueError, SyntaxError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2
-    seen = {}
-    for name, optional in entries:
-        seen[name] = seen.get(name, True) and optional
-    entries = [(name, seen[name]) for name in seen]
+    entries, soft = plan_entries(args.module, imports, subs)
 
-    runs = probe(args.python, entries, os.environ.copy(), overrides, lead,
-                 args.timeout)
-    report = build_report(args.python, runs, lead, list(overrides), task)
+    runs = probe(args.python, entries, base_env, overrides, lead, args.timeout)
+    report = build_report(args.python, runs, lead, list(overrides), task, soft,
+                          secret_pairs(overrides, base_env),
+                          bool(args.script))
     for line in render(report):
         print(line)
     if args.out:
@@ -744,6 +849,15 @@ _FIXTURES = {
                      "atexit.register(print, 'after the result')\n"),
     "ipfix_boom": "raise ValueError('boom at import')\n",
     "ipfix_die": "import os\nos._exit(7)\n",
+    "ipfix_diemsg": ("import os, sys\nif sys.stderr is not None:\n"
+                     "    sys.stderr.write('dying words\\n')\n"
+                     "    sys.stderr.flush()\nos._exit(7)\n"),
+    # Writes at import with no trailing newline; print() to None is silent.
+    "ipfix_noeol": "print('loading...', end='')\n",
+    "ipfix_leak": ("import os\nraise RuntimeError('bad ' + "
+                   "os.environ.get('IPFIX_TOKEN', '') + ' ' + "
+                   "os.environ.get('IPFIX_AMBIENT_KEY', '') + ' ' + "
+                   "os.environ.get('IPFIX_PLAIN', ''))\n"),
     "ipfix_hang": "import time\ntime.sleep(60)\n",
     "ipfix_nofile": "del __file__\n",
     "ipfix_gate": ("import os\nif os.environ.get('IPFIX_GATE') != 'open':\n"
@@ -872,7 +986,8 @@ def _self_test(tmp):
            "def late():\n    import hidden_lazy\n"
            "async def alate():\n    import hidden_async\n"
            "try:\n    pass\nexcept ImportError:\n    import in_handler\n"
-           "else:\n    import in_else\nfinally:\n    import in_finally\n")
+           "else:\n    import in_else\nfinally:\n    import in_finally\n"
+           "try:\n    import kerr\nexcept KeyError:\n    import kerr_handler\n")
     got = dict(script_imports(src))
     check(list(got)[:4] == ["os", "json.tool", "collections", "optdep"]
           and len(script_imports(src)) == len(got),
@@ -885,9 +1000,12 @@ def _self_test(tmp):
           "relative imports and imports inside a function are not probed"
           "  <-- pinned defect")
     check(got["optdep"] is True and got["bare"] is True
-          and got["fallbackmod"] is False,
+          and got["fallbackmod"] is True and got["in_handler"] is True,
           "an import guarded by except ImportError or a bare except is "
-          "optional, its fallback in the handler is not")
+          "optional, and so is the fallback import in that handler"
+          "  <-- pinned defect")
+    check(got["kerr_handler"] is False,
+          "an import in a handler that does not catch ImportError is required")
     check(got["warnedmod"] is True and got["risky"] is False
           and got["dotted"] is False,
           "a tuple naming ImportError guards, a handler for KeyError or an "
@@ -896,10 +1014,29 @@ def _self_test(tmp):
           "a name imported both guarded and unguarded counts as required"
           "  <-- pinned defect")
     check(got["inside_if"] is False and got["inside_else"] is False
-          and got["inside_class"] is False and got["in_handler"] is False
+          and got["inside_class"] is False
           and got["in_else"] is False and got["in_finally"] is False,
-          "imports inside if, else, class, handler, else and finally blocks "
-          "are found")
+          "imports inside if, else, class, else and finally blocks are found")
+    subs = {}
+    script_imports("from pkg import a, b as c\nfrom pkg import *\n"
+                   "from . import rel\nfrom .q import r\n"
+                   "try:\n    from opt import x\nexcept ImportError:\n"
+                   "    pass\nfrom opt import x\nimport plain\n"
+                   "from req import y\ntry:\n    from req import y\n"
+                   "except ImportError:\n    pass\n", subs)
+    check(subs == {"pkg.a": False, "pkg.b": False, "opt.x": False,
+                   "req.y": False},
+          "from pkg import name records pkg.name as a possible submodule, "
+          "skips star and relative imports, and is required when any use is"
+          "  <-- pinned defect")
+    entries_, soft_ = plan_entries(
+        ["m"], [("m", True), ("a", True), ("a", False), ("b", True)],
+        {"a.x": False, "b": True, "m.y": True})
+    check(entries_ == [("m", False), ("a", False), ("b", True),
+                       ("a.x", False), ("m.y", True)]
+          and soft_ == set(["a.x", "m.y"]),
+          "a name used twice is required if any use is, a --module name is "
+          "required, and a from-import name that is also a module is not soft")
     raises(lambda: script_imports("def broken(:\n"),
            "a script that does not parse raises SyntaxError", SyntaxError)
     check(script_imports("") == [], "an empty script imports nothing")
@@ -912,6 +1049,26 @@ def _self_test(tmp):
            "an env item with no equals sign is refused")
     raises(lambda: parse_env_pairs(["=value"]),
            "an env item with no name is refused")
+    try:
+        parse_env_pairs(["A=1", "=hunter2-typo"])
+    except ValueError as exc:
+        refusal = str(exc)
+    check("hunter2-typo" not in refusal and "item 2" in refusal,
+          "a refused env item is numbered and never echoed, because it may "
+          "be the secret  <-- pinned defect")
+    check(set(secret_pairs(
+        {"PYTHONPATH": "/long/path/here", "PYTHONNOUSERSITE": "1",
+         "MY_TOKEN": "abcd", "PLAIN": "abcdef", "SHORT": "abc",
+         "PLAINSHORT": "abcde", "PYTHONTOKEN": "tttt"},
+        {"AMBIENT_PASSWORD": "pw12", "HOME": "/home/x", "KEY": "abc"}))
+          == set([("AMBIENT_PASSWORD", "pw12"), ("MY_TOKEN", "abcd"),
+                  ("PLAIN", "abcdef"), ("PYTHONTOKEN", "tttt")]),
+          "secret_pairs hides secret-named values of four characters or more "
+          "and long --env values, but not PYTHON* settings or short values")
+    check(redact("a abc-long abc b", [("N1", "abc"), ("N2", "abc-long")])
+          == "a <redacted:N2> <redacted:N1> b"
+          and redact("keep", []) == "keep",
+          "redact replaces the longest secret first and leaves other text")
 
     # ---- classify_location and hidden_copies on synthetic facts
     ap = os.path.abspath
@@ -1058,6 +1215,39 @@ def _self_test(tmp):
     check("in the here context" in crash_h[0].text and "exit 9" in crash_h[0].text,
           "a crash only in the here context says here")
 
+    soft_miss = res(ok=False, etype="ModuleNotFoundError",
+                    err="No module named 'pkg.thing'")
+    parent_miss = res(ok=False, etype="ModuleNotFoundError",
+                      err="No module named 'pkg'")
+    other_miss = res(ok=False, etype="ModuleNotFoundError",
+                     err="No module named 'other'")
+    check(compare_module("pkg.thing", False, soft_miss, soft_miss, None,
+                         True) == []
+          and compare_module("pkg.thing", False, parent_miss, parent_miss,
+                             None, True) == [],
+          "a soft name missing in both contexts is a plain attribute, or its "
+          "package reports itself, so it is no finding  <-- pinned defect")
+    check(codes(compare_module("pkg.thing", False, soft_miss, soft_miss,
+                               None)) == ["NOT-IMPORTABLE"],
+          "the same result for a name that is not soft is a FAIL")
+    check(codes(compare_module("pkg.thing", False, other_miss, other_miss,
+                               None, True)) == ["NOT-IMPORTABLE"]
+          and codes(compare_module("pkg.thing", False, good, soft_miss, None,
+                                   True)) == ["NOT-IMPORTABLE"]
+          and codes(compare_module("pkg.thing", False, soft_miss, res(
+              ok=False, etype="ValueError", err="No module named 'pkg.thing'"),
+              None, True)) == ["IMPORT-ERROR"],
+          "a soft name is still a finding when another module is missing, "
+          "when it works here, or when the error is not a missing module")
+    check(names_missing("a.b", "ModuleNotFoundError", "No module named 'a.b'")
+          and names_missing("a.b", "ModuleNotFoundError",
+                            "No module named 'a'")
+          and not names_missing("ab.c", "ModuleNotFoundError",
+                                "No module named 'a'")
+          and not names_missing("a.b", "ModuleNotFoundError", "other text"),
+          "names_missing matches the module or a package above it, not a "
+          "name that only shares a prefix")
+
     # ---- verdict and exit codes
     mk = lambda sev: [Finding("m", "C", sev, "t")]
     check(verdict_of(mk(OK)) == OK and verdict_of(mk(WARN) + mk(OK)) == WARN
@@ -1145,6 +1335,20 @@ def _self_test(tmp):
     nf = _child_in_process(spec("ipfix_nofile", lead=lead_dir))["module"]
     check(nf["ok"] and nf["origin"] is None,
           "a module that deletes its own __file__ reports no origin")
+    other_dir = os.path.join(tmp, "other")
+    _write(os.path.join(other_dir, "ipfix_ns", "inner2.py"), "X = 2\n")
+    two_ns = _child_in_process(spec("ipfix_ns", lead=lead_dir),
+                               path_head=other_dir)["module"]
+    check(sorted(two_ns["candidates"]) == sorted([
+        os.path.join(lead_dir, "ipfix_ns"), os.path.join(other_dir, "ipfix_ns")]),
+          "a namespace directory in two places is listed as two copies")
+    _write(os.path.join(lead_dir, "ipfix_pos.py"), "X = 'lead'\n")
+    _write(os.path.join(other_dir, "ipfix_pos.py"), "X = 'other'\n")
+    importlib.invalidate_caches()
+    pos = _child_in_process(spec("ipfix_pos", lead=lead_dir),
+                            path_head=other_dir)["module"]
+    check(pos["top_origin"] == os.path.join(lead_dir, "ipfix_pos.py"),
+          "the script directory goes before every other sys.path entry")
     stdlib_dir = os.path.dirname(os.__file__)
     with_path_head = _child_in_process(spec("json"), path_head=stdlib_dir)
     check(with_path_head["module"]["ok"]
@@ -1172,6 +1376,10 @@ def _self_test(tmp):
           "PYTHONUSERBASE moves the user site, so the probe can plant a "
           "module there without touching the real one")
     _write(os.path.join(sp, "arcpy", "__init__.py"), _FAKE_ARCPY)
+    _write(os.path.join(sp, "arcpy", "sa.py"), "VALUE = 1\n")
+    _write(os.path.join(sp, "ipfancy", "__init__.py"), "ATTR = 1\n")
+    _write(os.path.join(sp, "ipfancy", "colour.py"),
+           "import sys\nCOLOUR = sys.stdout.isatty()\n")
     for name, body in _FIXTURES.items():
         if name not in ("ipfix_only", "ipfix_dup", "colorsys"):
             _write(os.path.join(sp, name + ".py"), body)
@@ -1241,10 +1449,10 @@ def _self_test(tmp):
 
     # The stub sits first on the path. A machine with the real arcpy still has
     # it as a hidden copy, so SHADOWS and OK are left out of these comparisons.
-    def licence_codes(mode):
-        rep_, _ = run(["arcpy"], {"IPFIX_LIC": mode} if mode else {},
+    def licence_codes(mode, name="arcpy"):
+        rep_, _ = run([name], {"IPFIX_LIC": mode} if mode else {},
                       lead=sp)
-        return rep_, [c for c in by_module(rep_)["arcpy"]
+        return rep_, [c for c in by_module(rep_)[name]
                       if c not in ("OK", "SHADOWS")]
 
     rep, found = licence_codes(None)
@@ -1259,6 +1467,9 @@ def _self_test(tmp):
           "an arcpy that imports but reports NotInitialized is LICENCE")
     check(licence_codes("broken")[1] == ["LICENCE-CHECK"],
           "a ProductInfo() that raises is LICENCE-CHECK")
+    check(licence_codes("uninit", "arcpy.sa")[1] == ["LICENCE"],
+          "a script that imports only arcpy.sa still gets the licence check"
+          "  <-- pinned defect")
 
     rep, _ = run(["ipfix_boom"])
     check(by_module(rep) == {"ipfix_boom": ["IMPORT-ERROR"]}
@@ -1275,8 +1486,30 @@ def _self_test(tmp):
           "a missing required import fails and a missing optional one warns")
     rep, _ = run(["ipfix_die"])
     check(by_module(rep) == {"ipfix_die": ["CRASH"]}
-          and "exit 7" in rep["findings"][0]["text"],
+          and "exit 7" in rep["findings"][0]["text"]
+          and rep["modules"][0]["here"] == "crash"
+          and rep["modules"][0]["task"] == "crash",
           "a module that kills the process is CRASH with its exit code")
+    dm = run_context(exe, spec("ipfix_diemsg"), child_env(env, {}), 30)
+    check(dm == {"crash": "exit 7 with no result: dying words"},
+          "a dead probe reports the last line of its stderr")
+    noeol = run_context(exe, spec("ipfix_noeol"), child_env(env, {}), 30)
+    check(noeol["module"]["ok"] and run(["ipfix_noeol"])[0]["verdict"] == OK,
+          "text a module writes at import without a newline does not hide "
+          "the result line  <-- pinned defect")
+    rep, _ = run(["json", "ipfix_reconf"])
+    check(rep["modules"] == [
+        {"name": "json", "optional": False, "here": "ok", "task": "ok"},
+        {"name": "ipfix_reconf", "optional": False, "here": "ok",
+         "task": "fail"}], "the report records ok, fail and crash per context")
+    shown = render(rep)
+    check("ipfix_reconf  ok     fail" in shown
+          and "json          ok     ok" in shown
+          and shown[-1] == "verdict: FAIL (1 fail, 0 warn)"
+          and [i for i, l in enumerate(shown) if l.startswith("FAIL")][0]
+          < [i for i, l in enumerate(shown) if l.startswith("OK")][0],
+          "the table shows each context, findings list the worst first, and "
+          "the verdict counts them once")
     rep, _ = run(["ipfix_hang"], timeout=1.5)
     check(by_module(rep) == {"ipfix_hang": ["CRASH"]}
           and "timed out" in rep["findings"][0]["text"],
@@ -1293,10 +1526,10 @@ def _self_test(tmp):
               "tainted"], bool), "the tainted flag is a boolean")
 
     # arcpy's licence path, in this process, against the stub
-    def arcpy_here(mode):
+    def arcpy_here(mode, name="arcpy"):
         os.environ["IPFIX_LIC"] = mode
         try:
-            return _child_in_process(spec("arcpy"), path_head=sp)
+            return _child_in_process(spec(name), path_head=sp)
         finally:
             del os.environ["IPFIX_LIC"]
 
@@ -1304,6 +1537,9 @@ def _self_test(tmp):
           "the child records the licence level of an arcpy that imports")
     check(arcpy_here("broken")["licence"]["error"].startswith("RuntimeError"),
           "the child records a ProductInfo() that raises")
+    check(arcpy_here("uninit", "arcpy.sa")["licence"]
+          == {"product": "NotInitialized", "error": None},
+          "the child checks the licence for a submodule of arcpy too")
     lic_dead = arcpy_here("raise")
     check(lic_dead["licence"] is None and not lic_dead["module"]["ok"]
           and "Product License" in lic_dead["module"]["error"],
@@ -1377,6 +1613,88 @@ def _self_test(tmp):
           "--task-xml alone reads the task and probes nothing")
 
     report_path = os.path.join(tmp, "report.json")
+    code, out, _ = cli(["--module", "ipfix_absent_q"])
+    check(code == 1 and "NOT-IMPORTABLE" in out
+          and "verdict: FAIL (1 fail, 0 warn)" in out,
+          "main exits 1 for a missing required module  <-- pinned defect")
+    fallback = os.path.join(tmp, "fallback.py")
+    _write(fallback, "try:\n    import json\nexcept ImportError:\n"
+           "    import ipfix_absent_e\n")
+    code, out, _ = cli(["--script", fallback])
+    check(code == 3 and "ipfix_absent_e" in out and "optional" in out,
+          "a fallback import in an except ImportError handler is optional, "
+          "so the script is a WARN and not a FAIL  <-- pinned defect")
+    nothing = os.path.join(tmp, "nothing.py")
+    _write(nothing, "x = 1\ndef f():\n    import json\n")
+    code, out, _ = cli(["--script", nothing])
+    check(code == 3 and "NOTHING-PROBED" in out
+          and "nothing was probed" in out,
+          "a script with no load-time import is a WARN that says nothing was "
+          "probed, not a clean OK  <-- pinned defect")
+    lib = os.path.join(tmp, "uselib.py")
+    _write(lib, "from ipfancy import ATTR, colour\n")
+    code, out, _ = cli(["--script", lib])
+    check(code == 1 and "STDOUT-NONE" in out and "ipfancy.colour" in out
+          and "ipfancy.ATTR" not in out and "2 module(s)" in out,
+          "from pkg import sub probes the submodule, and a plain attribute is "
+          "no row and no finding  <-- pinned defect")
+    attr = os.path.join(tmp, "attr.py")
+    _write(attr, "from collections import OrderedDict\n")
+    code, out, _ = cli(["--script", attr])
+    check(code == 0 and "1 module(s)" in out,
+          "from a stdlib package import a class is one module and exits 0")
+    gone = os.path.join(tmp, "gone.py")
+    _write(gone, "from ipfix_absent_s import thing\n")
+    code, out, _ = cli(["--script", gone])
+    check(code == 1 and out.count("NOT-IMPORTABLE") == 1,
+          "a missing package is reported once, not again for its name")
+    code, out, err = cli(["--module", "ipfix_leak", "--env",
+                          "IPFIX_TOKEN=s3cr3t-tok3n", "--env",
+                          "IPFIX_PLAIN=plainvalue1", "--out", report_path,
+                          "--apply"],
+                         dict(env, IPFIX_AMBIENT_KEY="ambient-k3y-value"))
+    with open(report_path) as handle:
+        leaked = handle.read()
+    check(code == 1 and "<redacted:IPFIX_TOKEN>" in out
+          and "<redacted:IPFIX_PLAIN>" in out
+          and "<redacted:IPFIX_AMBIENT_KEY>" in out
+          and not any(v in out + err + leaked for v in (
+              "s3cr3t-tok3n", "plainvalue1", "ambient-k3y-value")),
+          "an env value a module echoes in its error is redacted in the "
+          "output and in the JSON report  <-- pinned defect")
+    os.remove(report_path)
+    code, out, err = cli(["--module", "json", "--env", "=hunter2-typo-secret"])
+    check(code == 64 and "hunter2-typo-secret" not in out + err,
+          "a mistyped --env never echoes its value  <-- pinned defect")
+    notpy = os.path.join(tmp, "notpy.txt")
+    _write(notpy, "not an interpreter\n")
+    code, out, err = cli(["--module", "json", "--python", notpy])
+    check(code == 2 and "could not run the probe" in err and not out,
+          "an interpreter that cannot run the probe exits 2, not the 1 that "
+          "means an import fails  <-- pinned defect")
+    code, out, err = cli(["--module", "json", "--timeout", "0.001"])
+    check(code == 2 and "timed out" in err,
+          "a probe that exceeds the timeout before any import is exit 2")
+    check(all(cli(["--module", "json", "--timeout", t])[0] == 64
+              for t in ("nan", "inf", "1e7", "-1")),
+          "a timeout that is not a number, infinite, huge or negative is a "
+          "usage error  <-- pinned defect")
+    before = open(script).read()
+    code, _, err = cli(["--script", script, "--out", script, "--apply"])
+    check(code == 64 and "must not name" in err and open(script).read()
+          == before, "--out may not be the --script file, so --apply cannot "
+          "overwrite the script  <-- pinned defect")
+    code, _, err = cli(["--task-xml", xml, "--out", xml])
+    check(code == 64 and "must not name" in err,
+          "--out may not be the --task-xml file either")
+    real_self = globals()["self_test"]
+    globals()["self_test"] = lambda: 5
+    try:
+        passthrough = cli(["--self-test"])[0]
+    finally:
+        globals()["self_test"] = real_self
+    check(passthrough == 5, "--self-test returns the self-test exit code")
+
     code, out, _ = cli(["--module", "json", "--out", report_path])
     check(code == 0 and "Check only" in out
           and not os.path.exists(report_path),
@@ -1467,6 +1785,34 @@ def _self_test(tmp):
                   in line for line in odd),
           "the report is ASCII even when a module's error text is not  "
           "<-- pinned defect")
+
+    mixed = render({"python": "py", "env_overrides": [], "modules": [],
+                    "contexts": {"here": None, "task": None},
+                    "findings": [
+                        {"module": "m", "code": "A", "severity": OK,
+                         "text": "t"},
+                        {"module": "m", "code": "B", "severity": WARN,
+                         "text": "t"},
+                        {"module": "m", "code": "C", "severity": FAIL,
+                         "text": "t"}], "task": None, "verdict": FAIL})
+    check([l.split()[0] for l in mixed if l[:2] in ("OK", "WA", "FA")]
+          == ["FAIL", "WARN", "OK"]
+          and mixed[-1] == "verdict: FAIL (1 fail, 1 warn)"
+          and any("nothing was probed" in l for l in mixed),
+          "findings print FAIL, WARN, OK in that order and the counts are "
+          "exact  <-- pinned defect")
+    soft_run = [("pkg.thing", False, soft_miss, soft_miss),
+                ("pkg", False, good, good)]
+    soft_rep = build_report("py", soft_run, None, [], None, set(["pkg.thing"]))
+    check([m["name"] for m in soft_rep["modules"]] == ["pkg"]
+          and soft_rep["contexts"]["here"] is not None
+          and soft_rep["verdict"] == OK,
+          "a soft name that is not a finding gets no row")
+    empty_rep = build_report("py", [], None, [], None, (), (), True)
+    check(empty_rep["verdict"] == WARN
+          and [f["code"] for f in empty_rep["findings"]] == ["NOTHING-PROBED"]
+          and build_report("py", [], None, [])["verdict"] == OK,
+          "an empty run is a WARN for --script and OK for --task-xml alone")
 
     # ---- summary and importing the module runs nothing
     def summary(passed_count, failures):
